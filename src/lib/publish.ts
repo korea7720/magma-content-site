@@ -21,6 +21,17 @@ export interface PublishResult {
 }
 
 const SLUG_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+const LIMITS = {
+  title: 160,
+  description: 500,
+  content: 100_000,
+  tags: 20,
+  tag: 50,
+  slug: 80,
+  url: 2_048,
+  period: 32,
+} as const;
+const GITHUB_REQUEST_TIMEOUT_MS = 8_000;
 
 /** Authorization 헤더 검증 — timing-safe 비교 (길이 일치 시 상수시간) */
 export function verifyApiKey(header: string | null): boolean {
@@ -75,19 +86,22 @@ function validate(input: unknown): ValidInput {
 
   const errors: Record<string, string> = {};
   if (typeof b.title !== "string" || !b.title.trim()) errors.title = "필수 — 비어 있지 않은 문자열";
+  else if (b.title.trim().length > LIMITS.title) errors.title = `최대 ${LIMITS.title}자`;
   if (typeof b.description !== "string" || !b.description.trim()) errors.description = "필수 — 비어 있지 않은 문자열";
+  else if (b.description.trim().length > LIMITS.description) errors.description = `최대 ${LIMITS.description}자`;
   if (typeof b.content !== "string" || !b.content.trim()) errors.content = "필수 — 마크다운 본문";
-  if (b.slug !== undefined && (typeof b.slug !== "string" || !SLUG_RE.test(b.slug)))
-    errors.slug = "ASCII 소문자·숫자·하이픈만 (예: my-first-post)";
+  else if (b.content.length > LIMITS.content) errors.content = `최대 ${LIMITS.content}자`;
+  if (b.slug !== undefined && (typeof b.slug !== "string" || b.slug.length > LIMITS.slug || !SLUG_RE.test(b.slug)))
+    errors.slug = `ASCII 소문자·숫자·하이픈만, 최대 ${LIMITS.slug}자 (예: my-first-post)`;
   if (b.date !== undefined && (typeof b.date !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(b.date)))
     errors.date = "YYYY-MM-DD 형식";
-  if (b.tags !== undefined && (!Array.isArray(b.tags) || b.tags.some((t) => typeof t !== "string")))
-    errors.tags = "문자열 배열";
-  if (b.thumbnail !== undefined && (typeof b.thumbnail !== "string" || !isAssetPath(b.thumbnail)))
-    errors.thumbnail = "사이트 내부 경로 또는 http(s) URL";
-  if (b.period !== undefined && typeof b.period !== "string") errors.period = "문자열 (예: 2026-Q2)";
-  if (b.dashboardUrl !== undefined && (typeof b.dashboardUrl !== "string" || !isDashboardUrl(b.dashboardUrl)))
-    errors.dashboardUrl = "http(s) URL 또는 로컬 개발 URL";
+  if (b.tags !== undefined && (!Array.isArray(b.tags) || b.tags.length > LIMITS.tags || b.tags.some((t) => typeof t !== "string" || t.length > LIMITS.tag)))
+    errors.tags = `최대 ${LIMITS.tags}개, 각 태그 최대 ${LIMITS.tag}자의 문자열 배열`;
+  if (b.thumbnail !== undefined && (typeof b.thumbnail !== "string" || b.thumbnail.length > LIMITS.url || !isAssetPath(b.thumbnail)))
+    errors.thumbnail = `사이트 내부 경로 또는 http(s) URL, 최대 ${LIMITS.url}자`;
+  if (b.period !== undefined && (typeof b.period !== "string" || b.period.length > LIMITS.period)) errors.period = `문자열, 최대 ${LIMITS.period}자 (예: 2026-Q2)`;
+  if (b.dashboardUrl !== undefined && (typeof b.dashboardUrl !== "string" || b.dashboardUrl.length > LIMITS.url || !isDashboardUrl(b.dashboardUrl)))
+    errors.dashboardUrl = `http(s) URL 또는 로컬 개발 URL, 최대 ${LIMITS.url}자`;
   if (b.draft !== undefined && typeof b.draft !== "boolean") errors.draft = "true 또는 false";
   if (Object.keys(errors).length > 0) throw new PublishError(422, { error: "검증 실패", fields: errors });
 
@@ -171,24 +185,36 @@ function isDashboardUrl(value: string): boolean {
 async function commitToGitHub(collection: Collection, slug: string, md: string): Promise<string | undefined> {
   const repoFull = process.env.GITHUB_REPO as string;
   const url = `https://api.github.com/repos/${repoFull}/contents/content/${collection}/${slug}.md`;
+  const signal = AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS);
   const headers = {
     Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
     Accept: "application/vnd.github+json",
     "X-GitHub-Api-Version": "2022-11-28",
   };
-  const head = await fetch(url, { headers, cache: "no-store" });
+  let head: Response;
+  try {
+    head = await fetch(url, { headers, cache: "no-store", signal });
+  } catch {
+    throw new PublishError(502, { error: "GitHub 조회 실패 또는 8초 시간 초과" });
+  }
   if (head.status === 200)
     throw new PublishError(409, { error: `slug 중복 — content/${collection}/${slug}.md 가 이미 있습니다`, slug });
   if (head.status !== 404)
     throw new PublishError(502, { error: `GitHub 조회 실패 (HTTP ${head.status}) — GITHUB_TOKEN 권한·GITHUB_REPO 값을 확인하세요` });
-  const res = await fetch(url, {
-    method: "PUT",
-    headers,
-    body: JSON.stringify({
-      message: `${collection}: ${slug} 발행 (publish API)`,
-      content: Buffer.from(md, "utf8").toString("base64"),
-    }),
-  });
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "PUT",
+      headers,
+      signal,
+      body: JSON.stringify({
+        message: `${collection}: ${slug} 발행 (publish API)`,
+        content: Buffer.from(md, "utf8").toString("base64"),
+      }),
+    });
+  } catch {
+    throw new PublishError(502, { error: "GitHub 커밋 요청 실패 또는 8초 시간 초과" });
+  }
   if (!res.ok) {
     const detail = (await res.text()).slice(0, 300);
     throw new PublishError(502, { error: `GitHub 커밋 실패 (HTTP ${res.status})`, detail });
